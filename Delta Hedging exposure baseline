@@ -1,0 +1,138 @@
+# Install and load required packages
+if (!require("quantmod")) install.packages("quantmod")
+if (!require("ggplot2")) install.packages("ggplot2")
+library(quantmod)
+library(ggplot2)
+
+# Function to fetch options data
+get_options_data <- function(ticker) {
+  options_chain <- tryCatch(
+    getOptionChain(ticker),
+    error = function(e) {
+      message("Error fetching options data: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(options_chain)) {
+    return(NULL)
+  }
+  
+  all_data <- data.frame()
+  for (expiry in names(options_chain)) {
+    calls <- options_chain[[expiry]]$calls
+    puts <- options_chain[[expiry]]$puts
+    if (!is.null(calls) && !is.null(puts)) {
+      calls$type <- "CALL"
+      puts$type <- "PUT"
+      calls$expiry <- expiry
+      puts$expiry <- expiry
+      all_data <- rbind(all_data, calls, puts)
+    }
+  }
+  
+  if (nrow(all_data) == 0) {
+    message("No options data available for ", ticker)
+    return(NULL)
+  }
+  
+  # Parse expiry dates
+  all_data$expiry <- as.Date(all_data$expiry, format = "%Y-%m-%d")
+  all_data$DTE <- as.numeric(all_data$expiry - Sys.Date())
+  
+  return(all_data)
+}
+
+# Function to calculate delta exposure
+calculate_delta_exposure <- function(options_data, spot_price) {
+  if (is.null(options_data) || nrow(options_data) == 0) {
+    message("No data to calculate delta exposure")
+    return(NULL)
+  }
+  
+  options_data$delta_exposure <- ifelse(options_data$type == "CALL",
+                                        options_data$Delta * options_data$Volume * 100,
+                                        -options_data$Delta * options_data$Volume * 100)
+  
+  options_data$moneyness <- options_data$Strike / spot_price
+  
+  options_data$expiry_group <- cut(options_data$DTE, 
+                                   breaks = c(0, 7, 14, 30, 60, 90, Inf),
+                                   labels = c("0-7", "8-14", "15-30", "31-60", "61-90", "90+"))
+  
+  aggregated_data <- aggregate(delta_exposure ~ Strike + expiry_group + type, 
+                               data = options_data, 
+                               FUN = sum, 
+                               na.rm = TRUE)
+  
+  return(aggregated_data)
+}
+
+# Function to create the visualization
+create_options_plot <- function(delta_exposure_data, spot_price, ticker) {
+  if (is.null(delta_exposure_data) || nrow(delta_exposure_data) == 0) {
+    message("No data to plot")
+    return(NULL)
+  }
+  
+  max_exposure <- max(abs(delta_exposure_data$delta_exposure))
+  
+  p <- ggplot(delta_exposure_data, aes(x = delta_exposure, y = Strike, fill = expiry_group)) +
+    geom_bar(stat = "identity", position = "stack") +
+    facet_grid(. ~ type, scales = "free_x", space = "free_x") +
+    scale_x_continuous(labels = function(x) paste0(x / 1e6, "M"),
+                       limits = c(-max_exposure, max_exposure)) +
+    scale_y_continuous(breaks = seq(floor(min(delta_exposure_data$Strike)),
+                                    ceiling(max(delta_exposure_data$Strike)), by = 5)) +
+    geom_hline(yintercept = spot_price, color = "red", linetype = "dashed") +
+    geom_text(aes(x = 0, y = spot_price, label = paste("Spot Price:", spot_price)),
+              vjust = -0.5, hjust = 0.5, color = "red", size = 3) +
+    labs(title = paste(ticker, "DELTA HEDGING EXPOSURE"),
+         x = "DELTA HEDGING EXPOSURE",
+         y = "STRIKE",
+         fill = "DTE") +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  return(p)
+}
+
+# Main function
+options_visualizer <- function(ticker) {
+  # Fetch stock price
+  stock_data <- tryCatch(
+    getSymbols(ticker, auto.assign = FALSE),
+    error = function(e) {
+      message("Error fetching stock data: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(stock_data)) {
+    return(NULL)
+  }
+  
+  spot_price <- as.numeric(tail(Cl(stock_data), 1))
+  
+  # Fetch and process options data
+  options_data <- get_options_data(ticker)
+  if (is.null(options_data)) {
+    return(NULL)
+  }
+  
+  delta_exposure <- calculate_delta_exposure(options_data, spot_price)
+  if (is.null(delta_exposure)) {
+    return(NULL)
+  }
+  
+  # Create and display the plot
+  plot <- create_options_plot(delta_exposure, spot_price, ticker)
+  if (!is.null(plot)) {
+    print(plot)
+  }
+}
+
+# Example usage
+options_visualizer("QQQ")
