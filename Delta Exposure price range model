@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import yfinance as yf
+import numpy as np
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
+from filterpy.common import Q_discrete_white_noise
+from scipy.stats import norm
+from datetime import datetime, timedelta
+import pandas as pd
+
+def fetch_option_chain(ticker):
+	stock = yf.Ticker(ticker)
+	option_dates = stock.options
+	current_date = datetime.now().date()
+	valid_dates = [date for date in option_dates if datetime.strptime(date, '%Y-%m-%d').date() > current_date]
+	if not valid_dates:
+		raise ValueError("No valid expiration dates available.")
+	option_chain = stock.option_chain(valid_dates[0])
+	return option_chain.calls, option_chain.puts, stock
+
+def fx(x, dt):
+	return np.array([x[0] + np.random.normal(0, 0.0005),  # Volatility process noise
+					x[1] + np.random.normal(0, 0.0005)])  # Delta process noise
+					
+def hx(x):
+	return x  # We now observe both volatility and delta
+
+def initialize_ukf(initial_volatility, initial_delta):
+	points = MerweScaledSigmaPoints(2, alpha=.1, beta=2., kappa=1.)
+	ukf = UKF(dim_x=2, dim_z=2, fx=fx, hx=hx, dt=1., points=points)
+	ukf.x = np.array([initial_volatility, initial_delta])
+	ukf.P *= 1.5  # Initial uncertainty
+	ukf.R = np.array([[0.005, 0], [0, 0.005]])  # Measurement noise
+	ukf.Q = Q_discrete_white_noise(dim=2, dt=1., var=0.005)  # Process noise
+	return ukf
+
+def apply_ukf(volatilities, deltas):
+	ukf = initialize_ukf(volatilities[0], deltas[0])
+	filtered_vol = []
+	filtered_delta = []
+	for vol, delta in zip(volatilities, deltas):
+		ukf.predict()
+		ukf.update(np.array([vol, delta]))
+		filtered_vol.append(ukf.x[0])
+		filtered_delta.append(ukf.x[1])
+	return np.array(filtered_vol), np.array(filtered_delta)
+
+def calculate_delta(S, K, T, r, sigma, option_type='call'):
+	if T <= 0:
+		return 0  # Option expired
+	d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+	if option_type == 'call':
+		return norm.cdf(d1)
+	else:
+		return -norm.cdf(-d1)
+	
+def calculate_weighted_delta_exposure(calls, puts, S, K, T, r, filtered_delta):
+	call_exposure = 0
+	put_exposure = 0
+	
+	for i, call_row in calls.iterrows():
+		call_strike = call_row['strike']
+		call_iv = call_row['impliedVolatility']
+		call_oi = call_row['openInterest']
+		
+		call_delta = filtered_delta[i] if i < len(filtered_delta) else calculate_delta(S, call_strike, T, r, call_iv)
+		call_itm_probability = norm.cdf((np.log(S/call_strike) + (r + 0.5*call_iv**2)*T) / (call_iv*np.sqrt(T)))
+		call_exposure += call_delta * call_oi * 100 * call_itm_probability
+		
+	for i, put_row in puts.iterrows():
+		put_strike = put_row['strike']
+		put_iv = put_row['impliedVolatility']
+		put_oi = put_row['openInterest']
+		
+		put_delta = -filtered_delta[i] if i < len(filtered_delta) else -calculate_delta(S, put_strike, T, r, put_iv, 'put')
+		put_itm_probability = norm.cdf(-(np.log(S/put_strike) + (r + 0.5*put_iv**2)*T) / (put_iv*np.sqrt(T)))
+		put_exposure += put_delta * put_oi * 100 * put_itm_probability
+		
+	return call_exposure - put_exposure  # Net exposure
+
+def estimate_price_impact(weighted_delta_exposure, S, avg_volume, days=7):
+	liquidity_factor = min(1, abs(weighted_delta_exposure) / (avg_volume * days))
+	max_impact = 0.10  # Maximum 10% impact
+	
+	estimated_impact = S * liquidity_factor * max_impact
+	return estimated_impact if weighted_delta_exposure > 0 else -estimated_impact
+
+def get_market_sentiment():
+	vix = yf.Ticker("^VIX")
+	latest_data = vix.history(period="1d")
+	if not latest_data.empty:
+		return latest_data['Close'].iloc[-1]
+	else:
+		raise ValueError("Failed to fetch VIX data")
+		
+def interpret_vix(vix):
+	if vix < 12:
+		return "Extremely low volatility, high complacency"
+	elif vix < 14:
+		return "Low volatility, general optimism"
+	elif vix < 16:
+		return "Average volatility, neutral sentiment"
+	elif vix < 40:
+		return "High volatility, increased uncertainty"
+	else:
+		return "Very high volatility, fear in the market"
+	
+def generate_future_price_range(S, filtered_vol, weighted_delta_exposure, avg_volume, market_sentiment, days=7):
+	avg_volatility = np.mean(filtered_vol)
+	daily_volatility = avg_volatility / np.sqrt(252)
+	
+	vol_range = S * daily_volatility * np.sqrt(days)
+	exposure_impact = estimate_price_impact(weighted_delta_exposure, S, avg_volume, days)
+	sentiment_adjustment = S * 0.001 * market_sentiment  # 2% maximum sentiment impact
+	
+	high_price = S + vol_range + exposure_impact + sentiment_adjustment
+	low_price = S - vol_range - exposure_impact + sentiment_adjustment
+	
+	max_percent_change = 0.15  # 15% maximum change in a week
+	high_price = min(high_price, S * (1 + max_percent_change))
+	low_price = max(low_price, S * (1 - max_percent_change))
+	
+	return high_price, low_price
+
+def get_risk_free_rate():
+	return 0.0525  # 5.25% (example rate, you should update this regularly)
+
+def get_live_data(stock, calls):
+	S = stock.history(period="1d")['Close'].iloc[-1]
+	K = calls['strike'].mean()
+	
+	expiration_date = calls['lastTradeDate'].iloc[0].to_pydatetime().replace(tzinfo=None)
+	current_date = datetime.now()
+	T = max((expiration_date - current_date).days / 365, 28/365, 21/365, 14/365, 7/365) 
+	
+	r = get_risk_free_rate()
+	
+	return S, K, T, r
+
+def get_average_volume(stock):
+	hist = stock.history(period="1mo")
+	return hist['Volume'].mean()
+
+def calculate_historical_volatility(stock, window=30):
+	hist = stock.history(period="3mo")
+	log_returns = np.log(hist['Close'] / hist['Close'].shift(1))
+	return log_returns.rolling(window=window).std().iloc[-1] * np.sqrt(252)
+
+def main(ticker):
+	try:
+		calls, puts, stock = fetch_option_chain(ticker)
+		S, K, T, r = get_live_data(stock, calls)
+		
+		historical_volatility = calculate_historical_volatility(stock)
+		
+		volatilities = []
+		deltas = []
+		for _, option in calls.iterrows():
+			iv = option['impliedVolatility']
+			delta = calculate_delta(S, option['strike'], T, r, iv)
+			volatilities.append(iv)
+			deltas.append(delta)
+			
+		filtered_vol, filtered_delta = apply_ukf(volatilities, deltas)
+		
+		weighted_delta_exposure = calculate_weighted_delta_exposure(calls, puts, S, K, T, r, filtered_delta)
+		avg_volume = get_average_volume(stock)
+		market_sentiment = get_market_sentiment()
+		
+		high_price, low_price = generate_future_price_range(S, filtered_vol, weighted_delta_exposure, avg_volume, market_sentiment)
+		
+		print(f"Ticker: {ticker}")
+		print(f"Current stock price (S): ${S:.2f}")
+		print(f"Average strike price (K): ${K:.2f}")
+		print(f"Time to expiration (T in years): {T:.4f}")
+		print(f"Risk-free rate (r): {r:.4f}")
+		print(f"Historical Volatility (30-day): {historical_volatility:.4f}")
+		print(f"Average Filtered Implied Volatility: {np.mean(filtered_vol):.4f}")
+		print(f"Average Filtered Delta: {np.mean(filtered_delta):.4f}")
+		print(f"Weighted Delta Exposure: {weighted_delta_exposure:.2f}")
+		print(f"Average Daily Volume: {avg_volume:.0f}")
+		print(f"Market Sentiment (VIX): {market_sentiment:.2f}")
+		print(f"Forecasted high price for 1 week ahead: {high_price:.2f}")
+		print(f"Forecasted low price for 1 week ahead: {low_price:.2f}")
+		
+	except Exception as e:
+		print(f"Error: {e}")
+		
+# Run the script for a specific ticker
+ticker = "SPY"
+main(ticker)
