@@ -1,2 +1,3 @@
 Change ticker as desired.
-Written in R using Claude.
+Graph written in R using Claude.
+Price range model written in Python. 
